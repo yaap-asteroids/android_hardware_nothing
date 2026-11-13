@@ -673,7 +673,10 @@ bool HalProxy::sharedWakelockDidTimeout(int64_t* timeLeft) {
 
 void HalProxy::resetSharedWakelock() {
     std::lock_guard<std::recursive_mutex> lockGuard(mWakelockMutex);
-    decrementRefCountAndMaybeReleaseWakelock(mWakelockRefCount);
+    if (mWakelockRefCount > 0) {
+        release_wake_lock(kWakelockName);
+        mWakelockRefCount = 0;
+    }
     mWakelockTimeoutResetTime = getTimeNow();
 }
 
