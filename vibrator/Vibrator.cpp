@@ -10,10 +10,13 @@
 #include <log/log.h>
 
 #include <algorithm>
-#include <atomic>
+#include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <limits>
 #include <mutex>
 #include <thread>
+#include <utility>
 
 #include <android-base/properties.h>
 
@@ -56,14 +59,48 @@ namespace android {
 namespace hardware {
 namespace vibrator {
 
-static std::atomic<uint32_t> gComposeGen{0};
-
-// on() only arms a pending window; the following setAmplitude() plays it at
-// the amplitude the framework scaled for the user's intensity setting.
-static std::mutex gOnLock;
-static uint32_t gOnGen = 0;
+// Serialize cancellation with every hardware submission, including delayed work.
+static std::mutex gLock;
+static std::condition_variable gCondition;
+static uint64_t gGeneration = 0;
+static std::shared_ptr<IVibratorCallback> gCallback;
+static bool gOnActive = false;
 static int32_t gOnPendingMs = 0;
 static float gAmplitude = 1.0f;
+
+static void notifyComplete(const std::shared_ptr<IVibratorCallback>& callback) {
+    if (callback != nullptr && !callback->onComplete().isOk()) {
+        ALOGE("Vibrator completion callback failed");
+    }
+}
+
+// Called with gLock held. Complete an expired operation even if its worker ran late.
+static uint64_t beginLocked(const std::shared_ptr<IVibratorCallback>& callback) {
+    auto previous = std::move(gCallback);
+    if (previous != nullptr) {
+        std::thread([previous] { notifyComplete(previous); }).detach();
+    }
+    ++gGeneration;
+    gCallback = callback;
+    gOnActive = false;
+    gOnPendingMs = 0;
+    gCondition.notify_all();
+    return gGeneration;
+}
+
+// Called with gLock held. A canceled worker must not consume a newer callback.
+static std::shared_ptr<IVibratorCallback> finishLocked(uint64_t generation) {
+    if (gGeneration != generation) return nullptr;
+    gOnActive = false;
+    gOnPendingMs = 0;
+    return std::move(gCallback);
+}
+
+static bool waitLocked(std::unique_lock<std::mutex>& lock, uint64_t generation,
+                       std::chrono::steady_clock::time_point deadline) {
+    return !gCondition.wait_until(lock, deadline,
+                                 [generation] { return gGeneration != generation; });
+}
 
 static void sfdcF0Callback(float f0) {
     ALOGD("sfdc f0 update: %.1f", f0);
@@ -156,11 +193,10 @@ static void updateContinuousF0() {
 // Short windows (every pulse of ring and notification waveforms) play as a
 // transient click, which is far crisper than a stub of continuous drive.
 // Longer windows get the click as an attack and hold with continuous drive.
-static void playOnWindow(int32_t timeoutMs, float amplitude) {
+static int32_t playOnWindow(int32_t timeoutMs, float amplitude) {
     // Short window: a single crisp transient, nothing more.
     if (timeoutMs <= ON_TRANSIENT_MAX_MS) {
-        playTransient(RICHTAP_JND_EFFECT_CLICK, amplitude);
-        return;
+        return playTransient(RICHTAP_JND_EFFECT_CLICK, amplitude);
     }
 
     int32_t ret = 0;
@@ -170,10 +206,10 @@ static void playOnWindow(int32_t timeoutMs, float amplitude) {
         ret = playTransient(RICHTAP_JND_EFFECT_CLICK, amplitude);
         if (ret < 0) {
             ALOGE("AAC on transient failed: %d\n", ret);
-            return;
+            return ret;
         }
         if (timeoutMs <= ret) {
-            return;
+            return ret;
         }
     }
 
@@ -183,6 +219,7 @@ static void playOnWindow(int32_t timeoutMs, float amplitude) {
     if (ret < 0) {
         ALOGE("AAC on hold failed: %d\n", ret);
     }
+    return ret;
 }
 
 Vibrator::Vibrator() {
@@ -225,13 +262,22 @@ ndk::ScopedAStatus Vibrator::getCapabilities(int32_t* _aidl_return) {
 }
 
 ndk::ScopedAStatus Vibrator::off() {
-    ++gComposeGen;
+    std::shared_ptr<IVibratorCallback> callback;
+    bool stopped;
     {
-        std::lock_guard<std::mutex> lock(gOnLock);
-        ++gOnGen;
+        std::lock_guard<std::mutex> lock(gLock);
+        ++gGeneration;
+        gOnActive = false;
         gOnPendingMs = 0;
+        gAmplitude = 1.0f;
+        callback = std::move(gCallback);
+        stopped = aac_vibra_looper_stopPerformHe();
     }
-    if (!aac_vibra_looper_stopPerformHe()) {
+    gCondition.notify_all();
+    if (callback != nullptr) {
+        std::thread([callback] { notifyComplete(callback); }).detach();
+    }
+    if (!stopped) {
         ALOGE("AAC stop failed\n");
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
     }
@@ -245,34 +291,36 @@ ndk::ScopedAStatus Vibrator::on(int32_t timeoutMs,
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
     }
 
-    timeoutMs = static_cast<int32_t>(timeoutMs * 1.10f);
+    timeoutMs = static_cast<int32_t>(std::min<double>(
+            timeoutMs * 1.10, std::numeric_limits<int32_t>::max()));
 
-    uint32_t gen;
-    {
-        std::lock_guard<std::mutex> lock(gOnLock);
-        gen = ++gOnGen;
-        gOnPendingMs = timeoutMs;
-    }
+    std::lock_guard<std::mutex> lock(gLock);
+    uint64_t generation = beginLocked(callback);
+    gOnActive = true;
+    gOnPendingMs = timeoutMs;
+    const auto start = std::chrono::steady_clock::now();
 
     // Fallback for callers that never follow up with setAmplitude().
-    std::thread([=] {
-        usleep(ON_AMPLITUDE_WAIT_MS * 1000);
-        float amplitude;
-        {
-            std::lock_guard<std::mutex> lock(gOnLock);
-            if (gOnGen != gen || gOnPendingMs == 0) return;
-            gOnPendingMs = 0;
-            amplitude = gAmplitude;
+    std::thread([generation, timeoutMs, start] {
+        std::unique_lock<std::mutex> lock(gLock);
+        if (!waitLocked(lock, generation, start + std::chrono::milliseconds(ON_AMPLITUDE_WAIT_MS))) {
+            return;
         }
-        playOnWindow(timeoutMs, amplitude);
+        if (gOnPendingMs > 0) {
+            gOnPendingMs = 0;
+            if (playOnWindow(timeoutMs, gAmplitude) < 0) {
+                ALOGE("AAC pending on failed");
+                auto callback = finishLocked(generation);
+                lock.unlock();
+                notifyComplete(callback);
+                return;
+            }
+        }
+        if (!waitLocked(lock, generation, start + std::chrono::milliseconds(timeoutMs))) return;
+        auto callback = finishLocked(generation);
+        lock.unlock();
+        notifyComplete(callback);
     }).detach();
-
-    if (callback != nullptr) {
-        std::thread([=] {
-            usleep(timeoutMs * 1000);
-            callback->onComplete();
-        }).detach();
-    }
 
     return ndk::ScopedAStatus::ok();
 }
@@ -313,8 +361,14 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es,
             return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
     }
 
+    if (es != EffectStrength::LIGHT && es != EffectStrength::MEDIUM &&
+        es != EffectStrength::STRONG) {
+        return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_UNSUPPORTED_OPERATION));
+    }
+
     level *= effectStrengthToLevel(es);
 
+    std::lock_guard<std::mutex> lock(gLock);
     updateF0();
 
     int32_t ret = playTransient(id, level);
@@ -323,20 +377,35 @@ ndk::ScopedAStatus Vibrator::perform(Effect effect, EffectStrength es,
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
     }
 
-    if (effect == Effect::DOUBLE_CLICK) {
-        std::thread([=] {
-            usleep(DOUBLE_CLICK_GAP_MS * 1000);
-            playTransient(id, level);
-        }).detach();
-        ret = DOUBLE_CLICK_DURATION_MS;
-    }
+    uint64_t generation = beginLocked(callback);
+    const auto start = std::chrono::steady_clock::now();
 
-    if (callback != nullptr) {
-        std::thread([=] {
-            usleep(ret * 1000);
-            callback->onComplete();
-        }).detach();
-    }
+    if (effect == Effect::DOUBLE_CLICK) ret = DOUBLE_CLICK_DURATION_MS;
+
+    std::thread([generation, effect, id, level, ret, start] {
+        std::unique_lock<std::mutex> lock(gLock);
+        auto deadline = start + std::chrono::milliseconds(ret);
+        if (effect == Effect::DOUBLE_CLICK) {
+            if (!waitLocked(lock, generation, start + std::chrono::milliseconds(DOUBLE_CLICK_GAP_MS))) {
+                return;
+            }
+            if (playTransient(id, level) < 0) {
+                ALOGE("AAC second click failed");
+                auto callback = finishLocked(generation);
+                lock.unlock();
+                notifyComplete(callback);
+                return;
+            }
+            // A late second submission still needs its full nominal playback window.
+            deadline = std::max(deadline, std::chrono::steady_clock::now() +
+                                                  std::chrono::milliseconds(
+                                                          DOUBLE_CLICK_DURATION_MS - DOUBLE_CLICK_GAP_MS));
+        }
+        if (!waitLocked(lock, generation, deadline)) return;
+        auto callback = finishLocked(generation);
+        lock.unlock();
+        notifyComplete(callback);
+    }).detach();
 
     *_aidl_return = ret;
 
@@ -351,22 +420,30 @@ ndk::ScopedAStatus Vibrator::getSupportedEffects(std::vector<Effect>* _aidl_retu
 }
 
 ndk::ScopedAStatus Vibrator::setAmplitude(float amplitude) {
-    if (amplitude <= 0.0f || amplitude > 1.0f) {
+    if (!std::isfinite(amplitude) || amplitude <= 0.0f || amplitude > 1.0f) {
         return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
     }
 
-    int32_t pendingMs;
-    {
-        std::lock_guard<std::mutex> lock(gOnLock);
-        gAmplitude = amplitude;
-        pendingMs = gOnPendingMs;
-        gOnPendingMs = 0;
-    }
+    std::lock_guard<std::mutex> lock(gLock);
+    gAmplitude = amplitude;
+    int32_t pendingMs = gOnPendingMs;
+    gOnPendingMs = 0;
 
     if (pendingMs > 0) {
-        playOnWindow(pendingMs, amplitude);
+        if (playOnWindow(pendingMs, amplitude) < 0) {
+            auto callback = finishLocked(gGeneration);
+            ++gGeneration;
+            gCondition.notify_all();
+            if (callback != nullptr) {
+                std::thread([callback] { notifyComplete(callback); }).detach();
+            }
+            return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_SERVICE_SPECIFIC));
+        }
         return ndk::ScopedAStatus::ok();
     }
+
+    // Amplitude control applies only to on(), never prebaked/composed effects.
+    if (!gOnActive) return ndk::ScopedAStatus::ok();
 
     int32_t ret = setGain((uint8_t)std::lround(amplitude * 0xff));
     if (ret) {
@@ -426,8 +503,8 @@ ndk::ScopedAStatus Vibrator::compose(const std::vector<CompositeEffect>& composi
         uint32_t id;
         int32_t ms;
 
-        if (e.delayMs < 0 || e.delayMs > COMPOSE_DELAY_MAX_MS || e.scale < 0.0f ||
-            e.scale > 1.0f) {
+        if (e.delayMs < 0 || e.delayMs > COMPOSE_DELAY_MAX_MS || !std::isfinite(e.scale) ||
+            e.scale < 0.0f || e.scale > 1.0f) {
             return ndk::ScopedAStatus(AStatus_fromExceptionCode(EX_ILLEGAL_ARGUMENT));
         }
         if (e.primitive != CompositePrimitive::NOOP && !primitiveToEffect(e.primitive, &id, &ms)) {
@@ -435,25 +512,33 @@ ndk::ScopedAStatus Vibrator::compose(const std::vector<CompositeEffect>& composi
         }
     }
 
-    uint32_t gen = ++gComposeGen;
-    std::thread([=] {
+    std::lock_guard<std::mutex> lock(gLock);
+    uint64_t generation = beginLocked(callback);
+    std::thread([generation, composite] {
+        std::unique_lock<std::mutex> lock(gLock);
+        if (gGeneration != generation) return;
         updateF0();
         for (const auto& e : composite) {
             uint32_t id;
             int32_t ms;
 
-            if (gComposeGen.load() != gen) return;
-            if (e.delayMs > 0) {
-                usleep(e.delayMs * 1000);
-                if (gComposeGen.load() != gen) return;
+            if (!waitLocked(lock, generation,
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(e.delayMs))) {
+                return;
             }
             if (!primitiveToEffect(e.primitive, &id, &ms)) continue;
-            playTransient(id, e.scale);
-            usleep(ms * 1000);
+            if (playTransient(id, e.scale) < 0) {
+                ALOGE("AAC composed primitive failed");
+                break;
+            }
+            if (!waitLocked(lock, generation,
+                            std::chrono::steady_clock::now() + std::chrono::milliseconds(ms))) {
+                return;
+            }
         }
-        if (callback != nullptr && gComposeGen.load() == gen) {
-            callback->onComplete();
-        }
+        auto callback = finishLocked(generation);
+        lock.unlock();
+        notifyComplete(callback);
     }).detach();
 
     return ndk::ScopedAStatus::ok();
